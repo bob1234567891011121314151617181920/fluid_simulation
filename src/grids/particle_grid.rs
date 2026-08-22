@@ -43,44 +43,33 @@ impl ParticleGrid {
         neighbors
     }
 
-    pub fn get_wall_neighbors(&self, index: UVec3, number_of_neighbors: UVec3) -> Vec<usize> {
-        let mut neighbors = Vec::new();
+    pub fn for_each_wall_neighbor<F>(&self, index: UVec3, number_of_neighbors: UVec3, mut visit: F)
+    where
+        F: FnMut(usize),
+    {
+        let minimum = index.saturating_sub(number_of_neighbors);
+        let end = index
+            .saturating_add(number_of_neighbors)
+            .min(self.dimensions);
 
-        let min_x = index.x.saturating_sub(number_of_neighbors.x);
-        let min_y = index.y.saturating_sub(number_of_neighbors.y);
-        let min_z = index.z.saturating_sub(number_of_neighbors.z);
-
-        // Exclusive upper bounds
-        let max_x = index
-            .x
-            .saturating_add(number_of_neighbors.x)
-            .min(self.dimensions.x);
-
-        let max_y = index
-            .y
-            .saturating_add(number_of_neighbors.y)
-            .min(self.dimensions.y);
-
-        let max_z = index
-            .z
-            .saturating_add(number_of_neighbors.z)
-            .min(self.dimensions.z);
-
-        for x in min_x..max_x {
-            for y in min_y..max_y {
-                for z in min_z..max_z {
+        for x in minimum.x..end.x {
+            for y in minimum.y..end.y {
+                for z in minimum.z..end.z {
                     let cell_index = self.grid.get(x, y, z);
 
-                    if cell_index != EMPTY {
-                        neighbors.extend_from_slice(&self.cells[cell_index as usize]);
+                    if cell_index == EMPTY {
+                        continue;
+                    }
+
+                    for &particle_index in &self.cells[cell_index as usize] {
+                        visit(particle_index);
                     }
                 }
             }
         }
-        neighbors
     }
 
-    fn cell_sdf(
+    pub fn cell_sdf(
         &self,
         x: u32,
         y: u32,
@@ -107,7 +96,7 @@ impl ParticleGrid {
         0.2 * (1.0 / density.powi(3)) - accumulator
     }
 
-    fn build_sdf(&self, mac_grid: &mut MacGrid3D, density: f32, particles: &[Particle]) {
+    pub fn build_sdf(&self, mac_grid: &mut MacGrid3D, density: f32, particles: &[Particle]) {
         let dimensions = self.dimensions;
 
         for x in 0..dimensions.x {

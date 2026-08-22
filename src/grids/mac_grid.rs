@@ -52,9 +52,9 @@ impl MacGrid3D {
     pub fn check_wall(&self, x: u32, y: u32, z: u32) -> f32 {
         let cell_type = self.cell_type.get(x, y, z);
         if cell_type == CellType::Solid {
-            1.0
-        } else {
             -1.0
+        } else {
+            1.0
         }
     }
 }
@@ -68,18 +68,12 @@ pub enum ParticleType {
 pub struct Particle {
     pub position: Vec3,
     pub velocity: Vec3,
-    pub normal: Vec3,
+    //pub previous_position: Vec3,
+    pub previous_velocity: Vec3,
+    pub flip_velocity: Vec3,
     pub density: f32,
     pub mass: f32,
     pub particle_type: ParticleType,
-
-    pub temporary_position: Vec3,
-    pub temporary_velocity: Vec3,
-    pub previous_position: Vec3,
-    pub previous_velocity: Vec3,
-
-    invalid: bool,
-    temporarys: [bool; 2],
 }
 
 impl Particle {
@@ -87,18 +81,11 @@ impl Particle {
         Self {
             position,
             velocity,
-            normal: Vec3::ZERO,
-            density: 10.0,
+            previous_velocity: velocity,
+            density: 0.0,
             mass: 1.0,
             particle_type: ParticleType::Fluid,
-
-            temporary_position: Vec3::ZERO,
-            temporary_velocity: Vec3::ZERO,
-            previous_position: Vec3::ZERO,
-            previous_velocity: Vec3::ZERO,
-
-            invalid: false,
-            temporarys: [false; 2],
+            flip_velocity: Vec3::ZERO,
         }
     }
 }
