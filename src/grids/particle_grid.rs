@@ -19,28 +19,26 @@ impl ParticleGrid {
         }
     }
 
-    pub fn get_cell_neighbors(&self, index: UVec3, number_of_neighbors: UVec3) -> Vec<usize> {
-        let mut neighbors = vec![];
+    pub fn for_get_cell_neighbors<F>(&self, index: UVec3, number_of_neighbors: UVec3, mut visit: F)
+    where
+        F: FnMut(usize),
+    {
+        let minimum = index.saturating_sub(number_of_neighbors);
+        let end = index.min(self.dimensions);
 
-        let min_x = index.x.saturating_sub(number_of_neighbors.x);
-        let min_y = index.y.saturating_sub(number_of_neighbors.y);
-        let min_z = index.z.saturating_sub(number_of_neighbors.z);
-
-        let max_x = (index.x + number_of_neighbors.x).min(self.dimensions.x - 1);
-        let max_y = (index.y + number_of_neighbors.y).min(self.dimensions.y - 1);
-        let max_z = (index.z + number_of_neighbors.z).min(self.dimensions.z - 1);
-
-        for x in min_x..=max_x {
-            for y in min_y..=max_y {
-                for z in min_z..=max_z {
+        for x in minimum.x..=end.x {
+            for y in minimum.y..=end.y {
+                for z in minimum.z..=end.z {
                     let cell_index = self.grid.get(x, y, z);
-                    if cell_index != EMPTY {
-                        neighbors.extend_from_slice(&self.cells[cell_index as usize]);
+                    if cell_index == EMPTY {
+                        continue;
+                    }
+                    for &particle_index in &self.cells[cell_index as usize] {
+                        visit(particle_index);
                     }
                 }
             }
         }
-        neighbors
     }
 
     pub fn for_each_wall_neighbor<F>(&self, index: UVec3, number_of_neighbors: UVec3, mut visit: F)
@@ -48,9 +46,7 @@ impl ParticleGrid {
         F: FnMut(usize),
     {
         let minimum = index.saturating_sub(number_of_neighbors);
-        let end = index
-            .saturating_add(number_of_neighbors)
-            .min(self.dimensions);
+        let end = index.min(self.dimensions);
 
         for x in minimum.x..end.x {
             for y in minimum.y..end.y {

@@ -1,6 +1,9 @@
-use crate::grids::{CellType, Grid3D, MacGrid3D, Particle, ParticleGrid, ParticleType};
+use crate::{
+    grids::{CellType, Grid3D, MacGrid3D, Particle, ParticleGrid, ParticleType},
+    pcg_solver::pcg,
+};
 
-use glam::{IVec3, UVec3, Vec3, u32, vec3};
+use glam::{IVec3, UVec3, Vec3, camera::rh, u32, vec3};
 
 const GRAVITY: f32 = -9.81;
 
@@ -68,18 +71,18 @@ impl FlipSimulation {
                 (scaled_position.z as u32).min(self.dimensions.z - 1),
             );
 
-            let neighbors = self.particle_grid.get_cell_neighbors(cell, UVec3::ONE);
             let mut weight_sum = 0.0;
-            for &neighbor_index in neighbors.iter() {
-                let neighbor = &self.particles[neighbor_index];
+            self.particle_grid
+                .for_get_cell_neighbors(cell, UVec3::ONE, |neighbor_index| {
+                    let neighbor = &self.particles[neighbor_index];
 
-                let distance_squared = neighbor.position.distance_squared(particle.position);
-                // TODO use a better approximation
-                let weight = neighbor.mass
-                    * (1.0 - distance_squared / (kernel_radius * kernel_radius)).max(0.0);
+                    let distance_squared = neighbor.position.distance_squared(particle.position);
+                    // TODO use a better approximation
+                    let weight = neighbor.mass
+                        * (1.0 - distance_squared / (kernel_radius * kernel_radius)).max(0.0);
 
-                weight_sum += weight;
-            }
+                    weight_sum += weight;
+                });
             calculated_densities[particle_index] = weight_sum / self.max_density;
         }
 
@@ -245,6 +248,156 @@ impl FlipSimulation {
         }
     }
 
+    fn pressure_diagonal(
+        position: UVec3,
+        dimensions: UVec3,
+        cell_types: &Grid3D<CellType>,
+        inverse_h_squared: f32,
+    ) -> f32 {
+        let neighbors = [
+            position.saturating_sub(UVec3::X),
+            position + UVec3::X,
+            position.saturating_sub(UVec3::Y),
+            position + UVec3::Y,
+            position.saturating_sub(UVec3::Z),
+            position + UVec3::Z,
+        ];
+
+        let mut diagonal = 0.0;
+
+        for neighbor in neighbors {
+            if neighbor.x >= dimensions.x
+                || neighbor.y >= dimensions.y
+                || neighbor.z >= dimensions.z
+            {
+                continue;
+            }
+
+            match cell_types.get(neighbor.x, neighbor.y, neighbor.z) {
+                CellType::Solid => {}
+                CellType::Fluid | CellType::Air => {
+                    diagonal += inverse_h_squared;
+                }
+            }
+        }
+        diagonal
+    }
+
+    fn solve_pressure(&mut self) {
+        const MAX_ITERATIONS: usize = 50;
+        const RELATIVE_TOLERANCE: f32 = 1.0e-5;
+        const EPSILON: f32 = 1.0e-12;
+
+        let mac_grid = &mut self.mac_grid;
+        let dimensions = mac_grid.dimensions;
+        let max_dimensions = dimensions.max_element() as f32;
+        let h = 1.0 / max_dimensions;
+        let inverse_h_squared = 1.0 / (h * h);
+
+        let cell_types = &mac_grid.cell_type;
+        let divergence = &mac_grid.divergence;
+        let cell_count = (dimensions.x * dimensions.y * dimensions.z) as usize;
+        let index = |x: u32, y: u32, z: u32| ((x * dimensions.y + y) * dimensions.z + z) as usize;
+        let mut solution = vec![0.0; cell_count];
+        let mut rhs = vec![0.0; cell_count];
+        let mut inverse_diagonal = vec![0.0; cell_count];
+
+        for x in 0..dimensions.x {
+            for y in 0..dimensions.y {
+                for z in 0..dimensions.z {
+                    if cell_types.get(x, y, z) != CellType::Fluid {
+                        continue;
+                    }
+                    let cell_index = index(x, y, z);
+                    rhs[cell_index] = -divergence.get(x, y, z);
+                    let diagonal = Self::pressure_diagonal(
+                        UVec3::new(x, y, z),
+                        dimensions,
+                        cell_types,
+                        inverse_h_squared,
+                    );
+
+                    if diagonal > EPSILON {
+                        inverse_diagonal[cell_index] = 1.0 / diagonal;
+                    }
+                }
+            }
+        }
+
+        let apply_pressure_matrix = |input: &[f32], output: &mut [f32]| {
+            output.fill(0.0);
+            for x in 0..dimensions.x {
+                for y in 0..dimensions.y {
+                    for z in 0..dimensions.z {
+                        if cell_types.get(x, y, z) != CellType::Fluid {
+                            continue;
+                        }
+
+                        let position = UVec3::new(x, y, z);
+                        let cell_index = index(x, y, z);
+                        let diagonal = FlipSimulation::pressure_diagonal(
+                            position,
+                            dimensions,
+                            cell_types,
+                            inverse_h_squared,
+                        );
+                        let mut result = diagonal * input[cell_index];
+                        let neighbors = [
+                            position.saturating_sub(UVec3::X),
+                            position + UVec3::X,
+                            position.saturating_sub(UVec3::Y),
+                            position + UVec3::Y,
+                            position.saturating_sub(UVec3::Z),
+                            position + UVec3::Z,
+                        ];
+
+                        for neighbor in neighbors {
+                            if neighbor.x >= dimensions.x
+                                || neighbor.y >= dimensions.y
+                                || neighbor.z >= dimensions.z
+                            {
+                                continue;
+                            }
+
+                            if cell_types.get(neighbor.x, neighbor.y, neighbor.z) == CellType::Fluid
+                            {
+                                result -= inverse_h_squared
+                                    * input[index(neighbor.x, neighbor.y, neighbor.z)];
+                            }
+                        }
+                        output[cell_index] = result;
+                    }
+                }
+            }
+        };
+        let apply_preconditioner = |input: &[f32], output: &mut [f32]| {
+            for ((output, input), inverse_diagonal) in
+                output.iter_mut().zip(input).zip(&inverse_diagonal)
+            {
+                *output = input * inverse_diagonal;
+            }
+        };
+
+        pcg(
+            apply_pressure_matrix,
+            apply_preconditioner,
+            &mut solution,
+            &rhs,
+            MAX_ITERATIONS,
+            RELATIVE_TOLERANCE,
+        );
+
+        mac_grid.pressure.clear();
+        for x in 0..dimensions.x {
+            for y in 0..dimensions.y {
+                for z in 0..dimensions.z {
+                    if cell_types.get(x, y, z) == CellType::Fluid {
+                        mac_grid.pressure.set(x, y, z, solution[index(x, y, z)]);
+                    }
+                }
+            }
+        }
+    }
     fn project(&mut self) {
         let dimensions = self.mac_grid.dimensions;
         let mac_grid = &mut self.mac_grid;
@@ -263,9 +416,7 @@ impl FlipSimulation {
             }
         }
 
-        self.particle_grid
-            .build_sdf(mac_grid, self.density, &self.particles);
-
+        self.solve_pressure();
         self.subtract_pressure_gradient();
     }
 
