@@ -1,3 +1,5 @@
+use std::ops::Add;
+
 use glam::UVec3;
 
 use super::grid::{CellType, Grid3D};
@@ -24,7 +26,7 @@ impl ParticleGrid {
         F: FnMut(usize),
     {
         let minimum = index.saturating_sub(number_of_neighbors);
-        let end = index.min(self.dimensions);
+        let end = (index + number_of_neighbors).min(self.dimensions - UVec3::ONE);
 
         for x in minimum.x..=end.x {
             for y in minimum.y..=end.y {
@@ -46,11 +48,11 @@ impl ParticleGrid {
         F: FnMut(usize),
     {
         let minimum = index.saturating_sub(number_of_neighbors);
-        let end = index.min(self.dimensions);
+        let end = (index + number_of_neighbors).min(self.dimensions - UVec3::ONE);
 
-        for x in minimum.x..end.x {
-            for y in minimum.y..end.y {
-                for z in minimum.z..end.z {
+        for x in minimum.x..=end.x {
+            for y in minimum.y..=end.y {
+                for z in minimum.z..=end.z {
                     let cell_index = self.grid.get(x, y, z);
 
                     if cell_index == EMPTY {

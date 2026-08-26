@@ -1,13 +1,13 @@
 use crate::{
     grids::{CellType, Grid3D, MacGrid3D, Particle, ParticleGrid, ParticleType},
-    pcg_solver::pcg,
+    simulation::pcg_solver::pcg,
 };
 
 use glam::{IVec3, UVec3, Vec3, camera::rh, u32, vec3};
 
 const GRAVITY: f32 = -9.81;
 
-struct FlipSimulation {
+pub struct FlipSimulation {
     dimensions: UVec3,
 
     particles: Vec<Particle>,
@@ -54,8 +54,11 @@ impl FlipSimulation {
     fn compute_density(&mut self) {
         let max_dimension = self.dimensions.max_element() as f32;
         let kernel_radius = 4.0 * self.density / max_dimension;
-        let mut calculated_densities = vec![0.0; self.particles.len()];
 
+        let search_radius = (4.0 * self.density).ceil() as u32;
+        let neighbor_extent = UVec3::splat(search_radius);
+
+        let mut calculated_densities = vec![0.0; self.particles.len()];
         for particle_index in 0..self.particles.len() {
             let particle = &self.particles[particle_index];
 
@@ -72,8 +75,9 @@ impl FlipSimulation {
             );
 
             let mut weight_sum = 0.0;
+
             self.particle_grid
-                .for_get_cell_neighbors(cell, UVec3::ONE, |neighbor_index| {
+                .for_get_cell_neighbors(cell, neighbor_extent, |neighbor_index| {
                     let neighbor = &self.particles[neighbor_index];
 
                     let distance_squared = neighbor.position.distance_squared(particle.position);
@@ -91,7 +95,7 @@ impl FlipSimulation {
         }
     }
 
-    fn init(&mut self) {
+    pub fn init(&mut self) {
         let max_dimension = self.dimensions.max_element() as f32;
 
         let cell_width = 1.0 / max_dimension;
@@ -121,7 +125,7 @@ impl FlipSimulation {
             .iter()
             .filter(|particle| particle.particle_type == ParticleType::Fluid)
             .map(|particle| particle.density)
-            .fold(0.0_f32, f32::max);
+            .fold(0.0, f32::max);
 
         assert!(
             self.max_density > 0.0,
@@ -132,7 +136,7 @@ impl FlipSimulation {
 
         let domain_size = self.dimensions.as_vec3() / max_dimension;
         let fluid_min = domain_size * Vec3::new(0.05, 0.05, 0.05);
-        let fluid_max = domain_size * Vec3::new(0.45, 0.85, 0.85);
+        let fluid_max = domain_size * Vec3::new(0.5, 0.15, 0.15);
 
         let particle_counts = ((fluid_max - fluid_min) / particle_spacing)
             .floor()
@@ -152,10 +156,15 @@ impl FlipSimulation {
         }
 
         self.particle_grid.sort(&self.particles);
+        self.compute_density();
         self.particle_grid.mark_cell_types(
             &self.particles,
             &mut self.mac_grid.cell_type,
             self.density,
+        );
+        println!(
+            "Initialized simulation with {} particles",
+            self.particles.len()
         );
     }
 
@@ -254,25 +263,25 @@ impl FlipSimulation {
         cell_types: &Grid3D<CellType>,
         inverse_h_squared: f32,
     ) -> f32 {
+        let position = position.as_ivec3();
         let neighbors = [
-            position.saturating_sub(UVec3::X),
-            position + UVec3::X,
-            position.saturating_sub(UVec3::Y),
-            position + UVec3::Y,
-            position.saturating_sub(UVec3::Z),
-            position + UVec3::Z,
+            position - IVec3::X,
+            position + IVec3::X,
+            position - IVec3::Y,
+            position + IVec3::Y,
+            position - IVec3::Z,
+            position + IVec3::Z,
         ];
+        let dimensions = dimensions.as_ivec3();
 
         let mut diagonal = 0.0;
 
         for neighbor in neighbors {
-            if neighbor.x >= dimensions.x
-                || neighbor.y >= dimensions.y
-                || neighbor.z >= dimensions.z
-            {
+            if neighbor.cmplt(IVec3::ZERO).any() || neighbor.cmpge(dimensions).any() {
                 continue;
             }
 
+            let neighbor = neighbor.as_uvec3();
             match cell_types.get(neighbor.x, neighbor.y, neighbor.z) {
                 CellType::Solid => {}
                 CellType::Fluid | CellType::Air => {
@@ -378,7 +387,7 @@ impl FlipSimulation {
             }
         };
 
-        pcg(
+        let converged = pcg(
             apply_pressure_matrix,
             apply_preconditioner,
             &mut solution,
@@ -386,6 +395,10 @@ impl FlipSimulation {
             MAX_ITERATIONS,
             RELATIVE_TOLERANCE,
         );
+
+        if !converged {
+            log::warn!("Warning: Pressure solve did not converge");
+        }
 
         mac_grid.pressure.clear();
         for x in 0..dimensions.x {
@@ -489,9 +502,7 @@ impl FlipSimulation {
                         self.mac_grid.u_x.set(x, y, z, 0.0);
                         continue;
                     }
-                    if self.mac_grid.check_wall(x, y, z) * self.mac_grid.check_wall(x - 1, y, z)
-                        > 0.0
-                    {
+                    if self.mac_grid.check_wall(x, y, z) || self.mac_grid.check_wall(x - 1, y, z) {
                         self.mac_grid.u_x.set(x, y, z, 0.0);
                     }
                 }
@@ -505,10 +516,9 @@ impl FlipSimulation {
                         self.mac_grid.u_y.set(x, y, z, 0.0);
                         continue;
                     }
-                    if self.mac_grid.check_wall(x, y, z) * self.mac_grid.check_wall(x, y - 1, z)
-                        > 0.0
-                    {
-                        self.mac_grid.u_y.set(x, y, z, 0.0);
+                    if self.mac_grid.check_wall(x, y, z) || self.mac_grid.check_wall(x, y - 1, z) {
+                        println!("pain");
+                        self.mac_grid.u_x.set(x, y, z, 0.0);
                     }
                 }
             }
@@ -521,10 +531,88 @@ impl FlipSimulation {
                         self.mac_grid.u_z.set(x, y, z, 0.0);
                         continue;
                     }
-                    if self.mac_grid.check_wall(x, y, z) * self.mac_grid.check_wall(x, y, z - 1)
-                        > 0.0
-                    {
-                        self.mac_grid.u_z.set(x, y, z, 0.0);
+                    if self.mac_grid.check_wall(x, y, z) || self.mac_grid.check_wall(x, y, z - 1) {
+                        self.mac_grid.u_x.set(x, y, z, 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    fn extrapolate_velocity_component<F>(
+        velocity: &mut Grid3D<f32>,
+        cell_types: &Grid3D<CellType>,
+        face_dimensions: UVec3,
+        adjacent_cells: F,
+    ) where
+        F: Fn(UVec3) -> (Option<UVec3>, Option<UVec3>),
+    {
+        let mut fluid_mark = Grid3D::new(
+            face_dimensions.x,
+            face_dimensions.y,
+            face_dimensions.z,
+            false,
+        );
+        let mut wall_mark = Grid3D::new(
+            face_dimensions.x,
+            face_dimensions.y,
+            face_dimensions.z,
+            false,
+        );
+
+        for x in 0..face_dimensions.x {
+            for y in 0..face_dimensions.y {
+                for z in 0..face_dimensions.z {
+                    let position = UVec3::new(x, y, z);
+                    let (negative_cell, positive_cell) = adjacent_cells(position);
+                    let negative_type =
+                        negative_cell.map(|cell| cell_types.get(cell.x, cell.y, cell.z));
+                    let positive_type =
+                        positive_cell.map(|cell| cell_types.get(cell.x, cell.y, cell.z));
+
+                    let touches_fluid = negative_type == Some(CellType::Fluid)
+                        || positive_type == Some(CellType::Fluid);
+                    let touches_solid = negative_type == Some(CellType::Solid)
+                        || positive_type == Some(CellType::Solid);
+                    let boundary = negative_cell.is_none() || positive_cell.is_none();
+
+                    fluid_mark.set(x, y, z, touches_fluid);
+                    wall_mark.set(x, y, z, boundary || touches_solid);
+                }
+            }
+        }
+
+        for x in 0..face_dimensions.x {
+            for y in 0..face_dimensions.y {
+                for z in 0..face_dimensions.z {
+                    if fluid_mark.get(x, y, z) || wall_mark.get(x, y, z) {
+                        continue;
+                    }
+
+                    let position = UVec3::new(x, y, z);
+                    let neighbor_positions = [
+                        position.saturating_sub(UVec3::X),
+                        (position + UVec3::X).min(face_dimensions - UVec3::ONE),
+                        position.saturating_sub(UVec3::Y),
+                        (position + UVec3::Y).min(face_dimensions - UVec3::ONE),
+                        position.saturating_sub(UVec3::Z),
+                        (position + UVec3::Z).min(face_dimensions - UVec3::ONE),
+                    ];
+
+                    let mut velocity_sum = 0.0;
+                    let mut weight_sum = 0;
+
+                    for neighbor in neighbor_positions {
+                        if !fluid_mark.get(neighbor.x, neighbor.y, neighbor.z) {
+                            continue;
+                        }
+
+                        velocity_sum += velocity.get(neighbor.x, neighbor.y, neighbor.z);
+                        weight_sum += 1;
+                    }
+
+                    if weight_sum > 0 {
+                        velocity.set(x, y, z, velocity_sum / weight_sum as f32);
                     }
                 }
             }
@@ -533,189 +621,41 @@ impl FlipSimulation {
 
     fn extrapolate_velocities(&mut self) {
         let dimensions = self.mac_grid.dimensions;
+        let cell_types = &self.mac_grid.cell_type;
 
-        let face_dimensions = [
-            UVec3::new(dimensions.x + 1, dimensions.y, dimensions.z),
-            UVec3::new(dimensions.x, dimensions.y + 1, dimensions.z),
-            UVec3::new(dimensions.x, dimensions.y, dimensions.z + 1),
-        ];
-
-        let mut fluid_mark = [
-            Grid3D::new(
-                face_dimensions[0].x,
-                face_dimensions[0].y,
-                face_dimensions[0].z,
-                false,
-            ),
-            Grid3D::new(
-                face_dimensions[1].x,
-                face_dimensions[1].y,
-                face_dimensions[1].z,
-                false,
-            ),
-            Grid3D::new(
-                face_dimensions[2].x,
-                face_dimensions[2].y,
-                face_dimensions[2].z,
-                false,
-            ),
-        ];
-
-        let mut wall_mark = [
-            Grid3D::new(
-                face_dimensions[0].x,
-                face_dimensions[0].y,
-                face_dimensions[0].z,
-                false,
-            ),
-            Grid3D::new(
-                face_dimensions[1].x,
-                face_dimensions[1].y,
-                face_dimensions[1].z,
-                false,
-            ),
-            Grid3D::new(
-                face_dimensions[2].x,
-                face_dimensions[2].y,
-                face_dimensions[2].z,
-                false,
-            ),
-        ];
-
-        let mac_grid = &mut self.mac_grid;
-        for x in 0..=dimensions.x {
-            for y in 0..dimensions.y {
-                for z in 0..dimensions.z {
-                    fluid_mark[0].set(
-                        x,
-                        y,
-                        z,
-                        x > 0 && mac_grid.cell_type.get(x - 1, y, z) == CellType::Fluid
-                            || x < dimensions.x
-                                && mac_grid.cell_type.get(x, y, z) == CellType::Fluid,
-                    );
-                    let touches_solid = (x > 0
-                        && mac_grid.cell_type.get(x - 1, y, z) == CellType::Solid)
-                        || (x < dimensions.x && mac_grid.cell_type.get(x, y, z) == CellType::Solid);
-
-                    let boundary = x == 0 || x == dimensions.x;
-
-                    wall_mark[0].set(x, y, z, boundary || touches_solid);
-                }
-            }
-        }
-
-        for x in 0..dimensions.x {
-            for y in 0..=dimensions.y {
-                for z in 0..dimensions.z {
-                    fluid_mark[1].set(
-                        x,
-                        y,
-                        z,
-                        y > 0 && mac_grid.cell_type.get(x, y - 1, z) == CellType::Fluid
-                            || y < dimensions.y
-                                && mac_grid.cell_type.get(x, y, z) == CellType::Fluid,
-                    );
-                    let touches_solid = (y > 0
-                        && mac_grid.cell_type.get(x, y - 1, z) == CellType::Solid)
-                        || (y < dimensions.y && mac_grid.cell_type.get(x, y, z) == CellType::Solid);
-
-                    let boundary = y == 0 || y == dimensions.y;
-
-                    wall_mark[1].set(x, y, z, boundary || touches_solid);
-                }
-            }
-        }
-
-        for x in 0..dimensions.x {
-            for y in 0..dimensions.y {
-                for z in 0..=dimensions.z {
-                    fluid_mark[2].set(
-                        x,
-                        y,
-                        z,
-                        z > 0 && mac_grid.cell_type.get(x, y, z - 1) == CellType::Fluid
-                            || z < dimensions.z
-                                && mac_grid.cell_type.get(x, y, z) == CellType::Fluid,
-                    );
-                    let touches_solid = (z > 0
-                        && mac_grid.cell_type.get(x, y, z - 1) == CellType::Solid)
-                        || (z < dimensions.z && mac_grid.cell_type.get(x, y, z) == CellType::Solid);
-
-                    let boundary = z == 0 || z == dimensions.z;
-
-                    wall_mark[2].set(x, y, z, boundary || touches_solid);
-                }
-            }
-        }
-
-        for axis in 0..3 {
-            let axis_dimensions = face_dimensions[axis];
-
-            for x in 0..axis_dimensions.x {
-                for y in 0..axis_dimensions.y {
-                    for z in 0..axis_dimensions.z {
-                        if fluid_mark[axis].get(x, y, z) || wall_mark[axis].get(x, y, z) {
-                            continue;
-                        }
-
-                        let position = IVec3::new(x as i32, y as i32, z as i32);
-                        let neighbor_positions = [
-                            position + IVec3::new(-1, 0, 0),
-                            position + IVec3::new(1, 0, 0),
-                            position + IVec3::new(0, -1, 0),
-                            position + IVec3::new(0, 1, 0),
-                            position + IVec3::new(0, 0, -1),
-                            position + IVec3::new(0, 0, 1),
-                        ];
-
-                        let mut velocity_sum = 0.0;
-                        let mut weight_sum = 0;
-
-                        for neighbor in neighbor_positions {
-                            if neighbor.x < 0 || neighbor.y < 0 || neighbor.z < 0 {
-                                continue;
-                            }
-                            let neighbor = neighbor.as_uvec3();
-
-                            if neighbor.x >= axis_dimensions.x
-                                || neighbor.y >= axis_dimensions.y
-                                || neighbor.z >= axis_dimensions.z
-                            {
-                                continue;
-                            }
-
-                            if !fluid_mark[axis].get(neighbor.x, neighbor.y, neighbor.z) {
-                                continue;
-                            }
-
-                            let neighbor_velocity = match axis {
-                                0 => mac_grid.u_x.get(neighbor.x, neighbor.y, neighbor.z),
-                                1 => mac_grid.u_y.get(neighbor.x, neighbor.y, neighbor.z),
-                                2 => mac_grid.u_z.get(neighbor.x, neighbor.y, neighbor.z),
-                                _ => unreachable!(),
-                            };
-
-                            velocity_sum += neighbor_velocity;
-                            weight_sum += 1;
-                        }
-
-                        if weight_sum == 0 {
-                            continue;
-                        }
-
-                        let extrapolated_velocity = velocity_sum / weight_sum as f32;
-
-                        match axis {
-                            0 => mac_grid.u_x.set(x, y, z, extrapolated_velocity),
-                            1 => mac_grid.u_y.set(x, y, z, extrapolated_velocity),
-                            2 => mac_grid.u_z.set(x, y, z, extrapolated_velocity),
-                            _ => unreachable!(),
-                        }
-                    }
-                }
-            }
-        }
+        Self::extrapolate_velocity_component(
+            &mut self.mac_grid.u_x,
+            cell_types,
+            dimensions + UVec3::X,
+            |position| {
+                (
+                    (position.x > 0).then(|| position - UVec3::X),
+                    (position.x < dimensions.x).then_some(position),
+                )
+            },
+        );
+        Self::extrapolate_velocity_component(
+            &mut self.mac_grid.u_y,
+            cell_types,
+            dimensions + UVec3::Y,
+            |position| {
+                (
+                    (position.y > 0).then(|| position - UVec3::Y),
+                    (position.y < dimensions.y).then_some(position),
+                )
+            },
+        );
+        Self::extrapolate_velocity_component(
+            &mut self.mac_grid.u_z,
+            cell_types,
+            dimensions + UVec3::Z,
+            |position| {
+                (
+                    (position.z > 0).then(|| position - UVec3::Z),
+                    (position.z < dimensions.z).then_some(position),
+                )
+            },
+        );
     }
 
     fn subtract_grid_component(
@@ -858,8 +798,7 @@ impl FlipSimulation {
             if particle.particle_type == ParticleType::Solid {
                 continue;
             }
-            let velocity = Self::interpolate_velocities(&self.mac_grid, particle.position);
-            particle.position += velocity * self.step_size;
+            particle.position += particle.velocity * self.step_size;
         }
     }
 
@@ -910,13 +849,22 @@ impl FlipSimulation {
             &mut self.mac_grid.cell_type,
             self.density,
         );
-        self.previous_mac_grid = self.mac_grid.clone();
         self.enforce_boundary_velocities();
+        self.extrapolate_velocities();
+        self.previous_mac_grid = self.mac_grid.clone();
         self.project();
+        self.enforce_boundary_velocities();
         self.extrapolate_velocities();
         self.subtract_previous_grid();
         self.solve_pic_flip();
         self.advance_particles();
         self.constrain_particles_to_domain();
+    }
+
+    pub fn particle_positions(&self) -> impl Iterator<Item = Vec3> + '_ {
+        self.particles
+            .iter()
+            .filter(|particle| particle.particle_type == ParticleType::Fluid)
+            .map(|particle| particle.position)
     }
 }

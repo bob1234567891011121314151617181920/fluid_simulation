@@ -21,7 +21,6 @@ where
 
     let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(&a, &b)| a * b).sum::<f32>();
 
-    // residual = b - A*x
     apply_a(x, &mut a_direction);
 
     for i in 0..n {
@@ -35,10 +34,8 @@ where
         return true;
     }
 
-    // z = M^-1 * residual
     apply_preconditioner(&residual, &mut z);
 
-    // Initial search direction
     direction.copy_from_slice(&z);
 
     let mut residual_dot_z = dot(&residual, &z);
@@ -48,7 +45,6 @@ where
     }
 
     for _ in 0..max_iterations {
-        // A * direction
         apply_a(&direction, &mut a_direction);
 
         let direction_dot_a_direction = dot(&direction, &a_direction);

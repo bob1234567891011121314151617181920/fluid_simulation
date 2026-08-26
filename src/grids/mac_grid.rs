@@ -49,12 +49,12 @@ impl MacGrid3D {
         }
     }
 
-    pub fn check_wall(&self, x: u32, y: u32, z: u32) -> f32 {
+    pub fn check_wall(&self, x: u32, y: u32, z: u32) -> bool {
         let cell_type = self.cell_type.get(x, y, z);
         if cell_type == CellType::Solid {
-            -1.0
+            true
         } else {
-            1.0
+            false
         }
     }
 }

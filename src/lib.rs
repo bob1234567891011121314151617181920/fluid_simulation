@@ -1,3 +1,5 @@
 mod grids;
-mod pcg_solver;
-mod sim;
+mod rendering;
+mod simulation;
+
+pub use rendering::run;
