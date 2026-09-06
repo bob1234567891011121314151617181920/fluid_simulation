@@ -1,5 +1,3 @@
-use std::ops::Add;
-
 use glam::UVec3;
 
 use super::grid::{CellType, Grid3D};
@@ -7,7 +5,7 @@ use super::mac_grid::{MacGrid3D, Particle, ParticleType};
 
 const EMPTY: u32 = u32::MAX;
 pub struct ParticleGrid {
-    dimensions: UVec3,
+    pub dimensions: UVec3,
     grid: Grid3D<u32>,
     pub cells: Vec<Vec<usize>>,
 }
@@ -43,16 +41,17 @@ impl ParticleGrid {
         }
     }
 
-    pub fn for_each_wall_neighbor<F>(&self, index: UVec3, number_of_neighbors: UVec3, mut visit: F)
+    pub fn for_each_wall_neighbor<F>(&self, index: UVec3, extent: UVec3, mut visit: F)
     where
         F: FnMut(usize),
     {
-        let minimum = index.saturating_sub(number_of_neighbors);
-        let end = (index + number_of_neighbors).min(self.dimensions - UVec3::ONE);
+        let minimum = index.saturating_sub(extent);
 
-        for x in minimum.x..=end.x {
-            for y in minimum.y..=end.y {
-                for z in minimum.z..=end.z {
+        let end = (index + extent).min(self.dimensions);
+
+        for x in minimum.x..end.x {
+            for y in minimum.y..end.y {
+                for z in minimum.z..end.z {
                     let cell_index = self.grid.get(x, y, z);
 
                     if cell_index == EMPTY {
@@ -67,6 +66,7 @@ impl ParticleGrid {
         }
     }
 
+    /*
     pub fn cell_sdf(
         &self,
         x: u32,
@@ -110,33 +110,36 @@ impl ParticleGrid {
             }
         }
     }
+    */
 
-    pub fn mark_cell_types(
-        &self,
-        particles: &[Particle],
-        cell_types: &mut Grid3D<CellType>,
-        density: f32,
-    ) {
+    pub fn mark_cell_types(&self, particles: &[Particle], cell_types: &mut Grid3D<CellType>) {
         let dimensions = self.dimensions;
+
         for x in 0..dimensions.x {
             for y in 0..dimensions.y {
                 for z in 0..dimensions.z {
                     let cell_index = self.grid.get(x, y, z);
 
-                    let is_solid = cell_index != EMPTY
-                        && self.cells[cell_index as usize]
-                            .iter()
-                            .any(|&particle_index| {
-                                particles[particle_index].particle_type == ParticleType::Solid
-                            });
-
-                    let cell_type = if is_solid {
-                        CellType::Solid
-                    } else if self.cell_sdf(x, y, z, density, particles, ParticleType::Fluid) < 0.0
-                    {
-                        CellType::Fluid
-                    } else {
+                    let cell_type = if cell_index == EMPTY {
                         CellType::Air
+                    } else {
+                        let particle_indices = &self.cells[cell_index as usize];
+
+                        let contains_solid = particle_indices
+                            .iter()
+                            .any(|&index| particles[index].particle_type == ParticleType::Solid);
+
+                        let contains_fluid = particle_indices
+                            .iter()
+                            .any(|&index| particles[index].particle_type == ParticleType::Fluid);
+
+                        if contains_solid {
+                            CellType::Solid
+                        } else if contains_fluid {
+                            CellType::Fluid
+                        } else {
+                            CellType::Air
+                        }
                     };
 
                     cell_types.set(x, y, z, cell_type);

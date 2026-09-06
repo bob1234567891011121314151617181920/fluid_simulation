@@ -1,8 +1,12 @@
 mod camera;
+mod egui_renderer;
 mod sphere;
 mod texture;
 
-use self::{camera::create_static_camera, sphere::SphereVertex, texture::Texture};
+use self::{
+    camera::create_static_camera, egui_renderer::EguiRenderer, sphere::SphereVertex,
+    texture::Texture,
+};
 use crate::simulation::FlipSimulation;
 use anyhow::Context;
 use glam::UVec3;
@@ -19,6 +23,9 @@ use winit::{
 };
 
 const FIXED_DT_SECONDS: f32 = 1.0 / 120.0;
+const MAX_STEPS_PER_FRAME: usize = 8;
+
+const DIMENSIONS: UVec3 = UVec3::splat(16);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -64,16 +71,13 @@ pub struct State {
     globals_bind_group: wgpu::BindGroup,
     index_count: u32,
     instance_count: u32,
+    egui_renderer: EguiRenderer,
+    fps: f32,
 }
 
 impl State {
     async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
-        log::info!(
-            "Initializing renderer for a {}x{} window",
-            size.width,
-            size.height
-        );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             flags: Default::default(),
@@ -94,13 +98,6 @@ impl State {
             })
             .await
             .context("no compatible GPU adapter was found")?;
-        let adapter_info = adapter.get_info();
-        log::info!(
-            "Using GPU: {} ({:?}, {:?})",
-            adapter_info.name,
-            adapter_info.backend,
-            adapter_info.device_type
-        );
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Fluid simulation device"),
@@ -131,23 +128,15 @@ impl State {
             desired_maximum_frame_latency: 2,
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
+
         surface.configure(&device, &config);
-        let dimensions = UVec3::splat(32);
         let density = 0.5;
 
-        let mut simulation = FlipSimulation::new(dimensions, density, FIXED_DT_SECONDS);
-        simulation.init();
-        log::info!(
-            "Simulation initialized: grid={}x{}x{}, particles={}",
-            dimensions.x,
-            dimensions.y,
-            dimensions.z,
-            simulation.particle_positions().count()
-        );
+        let simulation = FlipSimulation::new(DIMENSIONS, density, FIXED_DT_SECONDS);
 
         let view_projection =
-            create_static_camera(dimensions, size.width, size.height).to_cols_array_2d();
-        let sphere_radius = (density / dimensions.max_element() as f32) * 0.4;
+            create_static_camera(DIMENSIONS, size.width, size.height).to_cols_array_2d();
+        let sphere_radius = (density / DIMENSIONS.max_element() as f32) * 0.4;
 
         let globals = Globals {
             view_projection,
@@ -275,12 +264,8 @@ impl State {
 
         let index_count = uv_sphere.1.len() as u32;
         let instance_count = instances.len() as u32;
-        log::info!(
-            "Render pipeline ready: {} sphere indices, {} particle instances",
-            index_count,
-            instance_count
-        );
 
+        let egui_renderer = EguiRenderer::new(&device, surface_format, None, &window);
         Ok(Self {
             window,
             surface,
@@ -297,7 +282,22 @@ impl State {
             globals_bind_group,
             index_count,
             instance_count,
+            egui_renderer,
+            fps: 0.0,
         })
+    }
+
+    fn update_fps(&mut self, frame_time: Duration) {
+        let dt = frame_time.as_secs_f32().max(f32::EPSILON);
+        let instant_fps = 1.0 / dt;
+        let smoothing_time = 0.4;
+        let alpha = 1.0 - (-dt / smoothing_time).exp();
+
+        self.fps = if self.fps == 0.0 {
+            instant_fps
+        } else {
+            self.fps + alpha * (instant_fps - self.fps)
+        };
     }
 
     fn update(&mut self) {
@@ -310,6 +310,16 @@ impl State {
             .collect();
         self.queue
             .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
+    }
+
+    fn draw_ui(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Debug")
+            .default_pos(egui::pos2(10.0, 10.0))
+            .show(ctx, |ui| {
+                ui.label(format!("FPS: {:.1}", self.fps));
+                ui.separator();
+                ui.heading("Fluid settings");
+            });
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -327,7 +337,6 @@ impl State {
     }
 
     fn render(&mut self) -> anyhow::Result<()> {
-        self.window.request_redraw();
         if !self.is_surface_configured {
             return Ok(());
         }
@@ -394,6 +403,29 @@ impl State {
         render_pass.draw_indexed(0..self.index_count, 0, 0..self.instance_count);
 
         drop(render_pass);
+
+        let egui_input = self.egui_renderer.take_input(&self.window);
+        let egui_context = self.egui_renderer.context();
+
+        let full_output = egui_context.run_ui(egui_input, |ui| {
+            self.draw_ui(ui);
+        });
+
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: self.window.scale_factor() as f32,
+        };
+
+        self.egui_renderer.end_frame_and_draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &self.window,
+            &view,
+            screen_descriptor,
+            full_output,
+        );
+
         self.queue.submit([encoder.finish()]);
         self.queue.present(output);
         Ok(())
@@ -404,37 +436,42 @@ pub struct App {
     state: Option<State>,
     last_frame: Instant,
     accumulator: Duration,
-    frames_since_report: u64,
-    last_report: Instant,
 }
 
 impl App {
     fn new() -> Self {
+        let now = Instant::now();
+
         Self {
             state: None,
-            last_frame: Instant::now(),
+            last_frame: now,
             accumulator: Duration::ZERO,
-            frames_since_report: 0,
-            last_report: Instant::now(),
         }
+    }
+
+    fn handle_frame_time(last_frame: &mut Instant, accumulator: &mut Duration) -> Duration {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(*last_frame);
+        let frame_time = elapsed.min(Duration::from_millis(250));
+
+        *last_frame = now;
+        *accumulator += frame_time;
+
+        elapsed
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
-            log::debug!("Application resumed with an existing renderer");
-            return;
-        }
-
-        log::info!("Application resumed; creating window");
         let window_attributes = Window::default_attributes()
             .with_title("FLIP Fluid Simulation")
             .with_fullscreen(Some(Fullscreen::Borderless(None)));
+
         let window = match event_loop.create_window(window_attributes) {
             Ok(window) => Arc::new(window),
+
             Err(error) => {
-                log::error!("Window creation failed: {error:#}");
+                log::error!("Failed to create window: {error}");
                 event_loop.exit();
                 return;
             }
@@ -442,18 +479,20 @@ impl ApplicationHandler for App {
 
         match pollster::block_on(State::new(window)) {
             Ok(state) => {
-                log::info!("Startup complete; entering render loop (Esc closes the window)");
                 state.window.request_redraw();
+
                 self.state = Some(state);
                 self.last_frame = Instant::now();
-                self.last_report = self.last_frame;
+                self.accumulator = Duration::ZERO;
             }
+
             Err(error) => {
-                log::error!("Renderer initialization failed: {error:#}");
+                log::error!("Failed to initialize renderer: {error:#}");
                 event_loop.exit();
             }
         }
     }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -465,70 +504,72 @@ impl ApplicationHandler for App {
             None => return,
         };
 
+        state.egui_renderer.handle_input(&state.window, &event);
+
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
+
+            WindowEvent::Resized(size) => {
+                state.resize(size.width, size.height);
+            }
+
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                event_loop.exit();
+            }
+
             WindowEvent::RedrawRequested => {
-                let now = Instant::now();
-                let frame_time = now.saturating_duration_since(self.last_frame);
-                self.last_frame = now;
-                self.accumulator += frame_time;
-                state.update();
-                self.frames_since_report += 1;
-                if now.duration_since(self.last_report) >= Duration::from_secs(2) {
-                    let seconds = now.duration_since(self.last_report).as_secs_f64();
-                    log::info!(
-                        "Running: {:.1} FPS, {} particles, last frame {:.2} ms",
-                        self.frames_since_report as f64 / seconds,
-                        state.instance_count,
-                        frame_time.as_secs_f64() * 1000.0
-                    );
-                    self.frames_since_report = 0;
-                    self.last_report = now;
-                    self.accumulator = Duration::ZERO;
+                let frame_time =
+                    Self::handle_frame_time(&mut self.last_frame, &mut self.accumulator);
+                state.update_fps(frame_time);
+
+                let fixed_dt = Duration::from_secs_f32(FIXED_DT_SECONDS);
+
+                let mut steps = 0;
+
+                while self.accumulator >= fixed_dt && steps < MAX_STEPS_PER_FRAME {
+                    state.update();
+
+                    self.accumulator -= fixed_dt;
+                    steps += 1;
                 }
+
+                if steps == MAX_STEPS_PER_FRAME {
+                    self.accumulator = Duration::ZERO;
+
+                    log::warn!("Simulation could not keep up with real time");
+                }
+
                 match state.render() {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::error!("Render error: {:?}", e);
+                    Ok(()) => {
+                        state.window.request_redraw();
+                    }
+                    Err(error) => {
+                        log::error!("Render error: {error:#}");
                         event_loop.exit();
                     }
                 }
             }
-            WindowEvent::Resized(physical_size) => {
-                state.resize(physical_size.width, physical_size.height);
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(code),
-                        state,
-                        ..
-                    },
-                ..
-            } => match (code, state.is_pressed()) {
-                (KeyCode::Escape, true) => event_loop.exit(),
-                _ => {}
-            },
             _ => {}
         }
     }
 }
 
 pub fn run() -> anyhow::Result<()> {
-    let mut logger =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    // Keep this application's health messages visible even if a machine-wide
-    // RUST_LOG setting (for example `warn`) suppresses dependency chatter.
-    logger
-        .filter_module(env!("CARGO_PKG_NAME"), log::LevelFilter::Info)
-        .format_timestamp_millis()
-        .init();
-    log::info!("Starting FLIP fluid simulation");
+    env_logger::init();
 
     let event_loop = EventLoop::builder().build()?;
     let mut app = App::new();
+
     event_loop.run_app(&mut app)?;
 
     Ok(())

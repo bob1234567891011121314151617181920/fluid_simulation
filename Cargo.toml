@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-glam = "0.33.5"
+glam = "0.33.6"
 
 anyhow = "1.0"
 winit = "0.30"
@@ -13,6 +13,10 @@ log = "0.4"
 wgpu = "30.0"
 pollster = "1.0.1"
 bytemuck = "1.25.2"
+egui = "0.36.1"
+egui-wgpu = { version = "0.36.1", features = ["winit"] }
+egui-winit = "0.36.1"
+
 
 [dependencies.image]
 version = "0.25.10"

@@ -9,6 +9,10 @@ pub struct MacGrid3D {
     pub u_y: Grid3D<f32>,
     pub u_z: Grid3D<f32>,
 
+    pub valid_u_x: Grid3D<bool>,
+    pub valid_u_y: Grid3D<bool>,
+    pub valid_u_z: Grid3D<bool>,
+
     pub divergence: Grid3D<f32>,
     pub pressure: Grid3D<f32>,
     pub cell_type: Grid3D<CellType>,
@@ -22,6 +26,10 @@ impl Clone for MacGrid3D {
             u_x: self.u_x.clone(),
             u_y: self.u_y.clone(),
             u_z: self.u_z.clone(),
+
+            valid_u_x: self.valid_u_x.clone(),
+            valid_u_y: self.valid_u_y.clone(),
+            valid_u_z: self.valid_u_z.clone(),
 
             divergence: self.divergence.clone(),
             pressure: self.pressure.clone(),
@@ -41,6 +49,10 @@ impl MacGrid3D {
             u_x: Grid3D::new(x + 1, y, z, 0.0),
             u_y: Grid3D::new(x, y + 1, z, 0.0),
             u_z: Grid3D::new(x, y, z + 1, 0.0),
+
+            valid_u_x: Grid3D::new(x + 1, y, z, false),
+            valid_u_y: Grid3D::new(x, y + 1, z, false),
+            valid_u_z: Grid3D::new(x, y, z + 1, false),
 
             divergence: Grid3D::new(x, y, z, 0.0),
             pressure: Grid3D::new(x, y, z, 0.0),
@@ -70,7 +82,7 @@ pub struct Particle {
     pub velocity: Vec3,
     //pub previous_position: Vec3,
     pub previous_velocity: Vec3,
-    pub flip_velocity: Vec3,
+    //pub flip_velocity: Vec3,
     pub density: f32,
     pub mass: f32,
     pub particle_type: ParticleType,
@@ -85,7 +97,7 @@ impl Particle {
             density: 0.0,
             mass: 1.0,
             particle_type: ParticleType::Fluid,
-            flip_velocity: Vec3::ZERO,
+            //flip_velocity: Vec3::ZERO,
         }
     }
 }

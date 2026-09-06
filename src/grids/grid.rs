@@ -44,11 +44,6 @@ impl<T: Clone> Grid3D<T> {
         self.data[index].clone()
     }
 
-    pub fn get_mut(&mut self, x: u32, y: u32, z: u32) -> &mut T {
-        let index = self.index(x, y, z);
-        &mut self.data[index]
-    }
-
     pub fn set(&mut self, x: u32, y: u32, z: u32, value: T) {
         let index = self.index(x, y, z);
         self.data[index] = value;

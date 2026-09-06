@@ -1,10 +1,8 @@
-use anyhow::*;
-use image::GenericImageView;
-
 pub struct Texture {
     #[allow(unused)]
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
+    #[allow(unused)]
     pub sampler: wgpu::Sampler,
 }
 
