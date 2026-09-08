@@ -57,7 +57,7 @@ impl MacGrid3D {
             divergence: Grid3D::new(x, y, z, 0.0),
             pressure: Grid3D::new(x, y, z, 0.0),
             cell_type: Grid3D::new(x, y, z, CellType::Air),
-            sdf: Grid3D::new(x, y, z, 1.6),
+            sdf: Grid3D::new(x, y, z, 1.0),
         }
     }
 

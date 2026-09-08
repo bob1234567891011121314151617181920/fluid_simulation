@@ -1,11 +1,9 @@
-use std::cell;
-
 use crate::{
     grids::{CellType, Grid3D, MacGrid3D, Particle, ParticleGrid, ParticleType},
     simulation::pcg_solver::pcg,
 };
 
-use glam::{IVec3, UVec3, Vec3, u32, vec3};
+use glam::{IVec3, UVec3, Vec3, u32, uvec3, vec3};
 
 const GRAVITY: f32 = -9.81;
 
@@ -31,7 +29,6 @@ impl FlipSimulation {
         let particle_grid = ParticleGrid::new(dimensions);
         let mac_grid = MacGrid3D::new(dimensions);
         let previous_mac_grid = MacGrid3D::new(dimensions);
-
         let mut simulation = Self {
             dimensions,
 
@@ -156,8 +153,8 @@ impl FlipSimulation {
 
         self.particle_grid.sort(&self.particles);
         self.compute_density();
-        self.particle_grid
-            .mark_cell_types(&self.particles, &mut self.mac_grid.cell_type);
+        self.build_fluid_sdf();
+        self.mark_cell_types();
     }
 
     fn apply_gravity(&mut self, dt: f32) {
@@ -271,6 +268,7 @@ impl FlipSimulation {
         position: UVec3,
         dimensions: UVec3,
         cell_types: &Grid3D<CellType>,
+        sdf: &Grid3D<f32>,
         inverse_h_squared: f32,
     ) -> f32 {
         let position = position.as_ivec3();
@@ -294,8 +292,13 @@ impl FlipSimulation {
             let neighbor = neighbor.as_uvec3();
             match cell_types.get(neighbor.x, neighbor.y, neighbor.z) {
                 CellType::Solid => {}
-                CellType::Fluid | CellType::Air => {
-                    diagonal += inverse_h_squared;
+                CellType::Fluid => diagonal += inverse_h_squared,
+                CellType::Air => {
+                    let theta = Self::interface_fraction(
+                        sdf.get(position.x as u32, position.y as u32, position.z as u32),
+                        sdf.get(neighbor.x, neighbor.y, neighbor.z),
+                    );
+                    diagonal += inverse_h_squared / theta;
                 }
             }
         }
@@ -333,6 +336,7 @@ impl FlipSimulation {
                         UVec3::new(x, y, z),
                         dimensions,
                         cell_types,
+                        &mac_grid.sdf,
                         inverse_h_squared,
                     );
 
@@ -358,6 +362,7 @@ impl FlipSimulation {
                             position.as_uvec3(),
                             dimensions,
                             cell_types,
+                            &mac_grid.sdf,
                             inverse_h_squared,
                         );
                         let mut result = diagonal * input[cell_index];
@@ -455,6 +460,8 @@ impl FlipSimulation {
 
         Self::subtract_pressure_gradient_component(
             &mac_grid.pressure,
+            &mac_grid.cell_type,
+            &mac_grid.sdf,
             &mut mac_grid.u_x,
             dimensions,
             0,
@@ -463,6 +470,8 @@ impl FlipSimulation {
 
         Self::subtract_pressure_gradient_component(
             &mac_grid.pressure,
+            &mac_grid.cell_type,
+            &mac_grid.sdf,
             &mut mac_grid.u_y,
             dimensions,
             1,
@@ -471,6 +480,8 @@ impl FlipSimulation {
 
         Self::subtract_pressure_gradient_component(
             &mac_grid.pressure,
+            &mac_grid.cell_type,
+            &mac_grid.sdf,
             &mut mac_grid.u_z,
             dimensions,
             2,
@@ -480,6 +491,8 @@ impl FlipSimulation {
 
     fn subtract_pressure_gradient_component(
         pressure: &Grid3D<f32>,
+        cell_types: &Grid3D<CellType>,
+        sdf: &Grid3D<f32>,
         velocity: &mut Grid3D<f32>,
         dimensions: UVec3,
         component: usize,
@@ -495,9 +508,28 @@ impl FlipSimulation {
                     let mut backward = forward;
                     backward[component] -= 1;
 
+                    let forward_type = cell_types.get(forward.x, forward.y, forward.z);
+                    let backward_type = cell_types.get(backward.x, backward.y, backward.z);
+                    if forward_type == CellType::Solid
+                        || backward_type == CellType::Solid
+                        || (forward_type != CellType::Fluid && backward_type != CellType::Fluid)
+                    {
+                        continue;
+                    }
+                    let phi_forward = sdf.get(forward.x, forward.y, forward.z);
+                    let phi_backward = sdf.get(backward.x, backward.y, backward.z);
+                    let theta = match (forward_type, backward_type) {
+                        (CellType::Fluid, CellType::Air) => {
+                            Self::interface_fraction(phi_forward, phi_backward)
+                        }
+                        (CellType::Air, CellType::Fluid) => {
+                            Self::interface_fraction(phi_backward, phi_forward)
+                        }
+                        _ => 1.0,
+                    };
                     let forward_pressure = pressure.get(forward.x, forward.y, forward.z);
                     let backward_pressure = pressure.get(backward.x, backward.y, backward.z);
-                    let pressure_gradient = (forward_pressure - backward_pressure) / h;
+                    let pressure_gradient = (forward_pressure - backward_pressure) / (h * theta);
                     let corrected_velocity =
                         velocity.get(forward.x, forward.y, forward.z) - pressure_gradient;
 
@@ -1054,16 +1086,82 @@ impl FlipSimulation {
         required_substeps.clamp(1, MAX_SUBSTEPS)
     }
 
-    fn substep(&mut self, dt: f32) {
-        self.particle_grid.sort(&self.particles);
+    fn build_fluid_sdf(&mut self) {
+        let dimensions = self.dimensions;
+        let max_dimension = dimensions.max_element() as f32;
 
-        self.compute_density();
-        self.apply_gravity(dt);
+        let particle_spacing = self.density / max_dimension;
+        let particle_radius = 1.5 * particle_spacing;
 
-        self.transfer_particle_velocities_to_mac_grid();
+        let search_extent = (particle_radius * max_dimension).ceil() as u32 + 1;
+        let particles = &self.particles;
+        let particle_grid = &self.particle_grid;
 
+        let fluid_sdf = &mut self.mac_grid.sdf;
+        // Truncate the field one cell outside the surface; pressure only needs
+        // distances at adjacent fluid/air cell centers.
+        let band_width = 1.0 / max_dimension;
+
+        for x in 0..self.dimensions.x {
+            for y in 0..self.dimensions.y {
+                for z in 0..self.dimensions.z {
+                    let mut minimum_distance = band_width;
+                    let cell = uvec3(x, y, z);
+                    let cell_center = (cell.as_vec3() + Vec3::splat(0.5)) / max_dimension;
+                    particle_grid.for_get_cell_neighbors(
+                        cell,
+                        UVec3::splat(search_extent),
+                        |particle_index| {
+                            let particle = &particles[particle_index];
+                            if particle.particle_type != ParticleType::Fluid {
+                                return;
+                            }
+
+                            let phi = cell_center.distance(particle.position) - particle_radius;
+                            minimum_distance = minimum_distance.min(phi);
+                        },
+                    );
+                    fluid_sdf.set(x, y, z, minimum_distance);
+                }
+            }
+        }
+    }
+
+    fn mark_cell_types(&mut self) {
         self.particle_grid
             .mark_cell_types(&self.particles, &mut self.mac_grid.cell_type);
+        for x in 0..self.dimensions.x {
+            for y in 0..self.dimensions.y {
+                for z in 0..self.dimensions.z {
+                    if self.mac_grid.cell_type.get(x, y, z) != CellType::Solid {
+                        let kind = if self.mac_grid.sdf.get(x, y, z) < 0.0 {
+                            CellType::Fluid
+                        } else {
+                            CellType::Air
+                        };
+                        self.mac_grid.cell_type.set(x, y, z, kind);
+                    }
+                }
+            }
+        }
+    }
+
+    fn interface_fraction(phi_fluid: f32, phi_air: f32) -> f32 {
+        let denominator = phi_fluid - phi_air;
+
+        if denominator.abs() <= f32::EPSILON {
+            return 1.0;
+        }
+
+        (phi_fluid / denominator).clamp(0.01, 1.0)
+    }
+    fn substep(&mut self, dt: f32) {
+        self.particle_grid.sort(&self.particles);
+        self.compute_density();
+        self.apply_gravity(dt);
+        self.build_fluid_sdf();
+        self.transfer_particle_velocities_to_mac_grid();
+        self.mark_cell_types();
         self.enforce_boundary_velocities();
         self.previous_mac_grid = self.mac_grid.clone();
         self.project();
@@ -1092,5 +1190,70 @@ impl FlipSimulation {
             .iter()
             .filter(|particle| particle.particle_type == ParticleType::Fluid)
             .map(|particle| particle.position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sdf_matches_particle_distances_and_resets_after_removal() {
+        let mut sim = FlipSimulation::new(uvec3(8, 6, 4), 0.5, 0.01);
+        sim.particles = vec![Particle::new_fluid(vec3(1.5, 1.5, 1.5) / 8.0, Vec3::ZERO)];
+        let mut solid = Particle::new_fluid(vec3(6.5, 4.5, 2.5) / 8.0, Vec3::ZERO);
+        solid.particle_type = ParticleType::Solid;
+        sim.particles.push(solid);
+        sim.particle_grid.sort(&sim.particles);
+        sim.build_fluid_sdf();
+        sim.mark_cell_types();
+        for x in 0..8 {
+            for y in 0..6 {
+                for z in 0..4 {
+                    let center = (uvec3(x, y, z).as_vec3() + Vec3::splat(0.5)) / 8.0;
+                    let expected =
+                        (center.distance(sim.particles[0].position) - 0.75 / 8.0).min(1.0 / 8.0);
+                    assert!((sim.mac_grid.sdf.get(x, y, z) - expected).abs() < 1e-6);
+                }
+            }
+        }
+        assert_eq!(sim.mac_grid.cell_type.get(1, 1, 1), CellType::Fluid);
+        assert_eq!(sim.mac_grid.cell_type.get(6, 4, 2), CellType::Solid);
+        sim.particles.clear();
+        sim.particle_grid.sort(&sim.particles);
+        sim.build_fluid_sdf();
+        sim.mark_cell_types();
+        assert_eq!(sim.mac_grid.sdf.get(1, 1, 1), 1.0 / 8.0);
+        assert_eq!(sim.mac_grid.cell_type.get(1, 1, 1), CellType::Air);
+    }
+
+    #[test]
+    fn surface_projection_removes_divergence_on_every_axis() {
+        for axis in 0..3 {
+            for reverse in [false, true] {
+                let mut sim = FlipSimulation::new(UVec3::splat(3), 0.5, 0.01);
+                sim.mac_grid = MacGrid3D::new(UVec3::splat(3));
+                sim.mac_grid.cell_type.set(1, 1, 1, CellType::Fluid);
+                sim.mac_grid.sdf.set(1, 1, 1, -0.1);
+                let mut face = UVec3::ONE;
+                if reverse {
+                    face[axis] += 1;
+                }
+                let velocity = match axis {
+                    0 => &mut sim.mac_grid.u_x,
+                    1 => &mut sim.mac_grid.u_y,
+                    _ => &mut sim.mac_grid.u_z,
+                };
+                velocity.set(face.x, face.y, face.z, 1.0);
+                sim.project();
+                let grid = &sim.mac_grid;
+                let divergence = grid.u_x.get(2, 1, 1) - grid.u_x.get(1, 1, 1)
+                    + grid.u_y.get(1, 2, 1)
+                    - grid.u_y.get(1, 1, 1)
+                    + grid.u_z.get(1, 1, 2)
+                    - grid.u_z.get(1, 1, 1);
+                assert!(divergence.abs() < 1e-5, "axis {axis}: {divergence}");
+            }
+        }
     }
 }

@@ -1,7 +1,7 @@
 use glam::UVec3;
 
 use super::grid::{CellType, Grid3D};
-use super::mac_grid::{MacGrid3D, Particle, ParticleType};
+use super::mac_grid::{Particle, ParticleType};
 
 const EMPTY: u32 = u32::MAX;
 pub struct ParticleGrid {
@@ -65,52 +65,6 @@ impl ParticleGrid {
             }
         }
     }
-
-    /*
-    pub fn cell_sdf(
-        &self,
-        x: u32,
-        y: u32,
-        z: u32,
-        density: f32,
-        particles: &[Particle],
-        particle_type: ParticleType,
-    ) -> f32 {
-        let mut accumulator = 0.0;
-
-        let cell_index = self.grid.get(x, y, z);
-
-        if cell_index != EMPTY {
-            for &particle_index in &self.cells[cell_index as usize] {
-                let particle = &particles[particle_index];
-                if particle.particle_type == particle_type {
-                    accumulator += particle.density;
-                } else {
-                    return 1.0;
-                }
-            }
-        }
-
-        0.2 * (1.0 / density.powi(3)) - accumulator
-    }
-
-    pub fn build_sdf(&self, mac_grid: &mut MacGrid3D, density: f32, particles: &[Particle]) {
-        let dimensions = self.dimensions;
-
-        for x in 0..dimensions.x {
-            for y in 0..dimensions.y {
-                for z in 0..dimensions.z {
-                    mac_grid.sdf.set(
-                        x,
-                        y,
-                        z,
-                        self.cell_sdf(x, y, z, density, particles, ParticleType::Fluid),
-                    );
-                }
-            }
-        }
-    }
-    */
 
     pub fn mark_cell_types(&self, particles: &[Particle], cell_types: &mut Grid3D<CellType>) {
         let dimensions = self.dimensions;
